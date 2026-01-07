@@ -198,6 +198,311 @@ BaseAgent (抽象基类)
 
 ---
 
+## 模块协作关系
+
+### 整体架构图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         入口层 (main.py)                          │
+│                    run_flow.py / run_mcp.py 等                   │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         Flow 层                                   │
+│    BaseFlow / PlanningFlow (编排多个 Agent)                       │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│   Manus       │   │  DataAnalysis │   │   Other       │
+│   Agent       │   │    Agent      │   │    Agents     │
+└───────┬───────┘   └───────┬───────┘   └───────┬───────┘
+        │                   │                   │
+        └─────────────────────┬──────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Agent 层                                    │
+│              BaseAgent / ReActAgent / ToolCallAgent               │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ Core: LLM + Memory + State + Tools                          │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│      LLM      │   │    Memory     │   │ToolCollection │
+│  (OpenAI/     │   │   (消息历史)  │   │  (工具集合)    │
+│   Azure/      │   │               │   │               │
+│   Bedrock)    │   │               │   │               │
+└───────┬───────┘   └───────────────┘   └───────┬───────┘
+        │                                       │
+        ▼                                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Tool 层 (BaseTool 的子类)                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
+│  │  Browser │  │  Bash    │  │  Editor  │  │  MCPClientTool   │ │
+│  │  UseTool │  │          │  │          │  │                  │ │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     配置层 (Config)                               │
+│           config.toml + mcp.json + environment                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 模块职责说明
+
+| 模块 | 职责 | 核心依赖 |
+|------|------|----------|
+| **Config** | 提供所有配置（LLM、浏览器、工具等） | TOML 配置文件 |
+| **LLM** | 封装大语言模型调用（OpenAI/Azure/Bedrock） | Config + OpenAI 客户端 |
+| **BaseAgent** | Agent 基类：状态管理、消息内存、执行循环 | LLM + Memory |
+| **ReActAgent** | 实现 Think-Act 模式 | BaseAgent |
+| **ToolCallAgent** | 工具调用核心逻辑 | ReActAgent + ToolCollection |
+| **ToolCollection** | 管理工具集合、执行工具 | BaseTool |
+| **BaseTool** | 所有工具的基类 | - |
+| **BaseFlow** | 编排多个 Agent | BaseAgent |
+| **PlanningFlow** | 任务规划与分步执行 | BaseFlow + LLM + PlanningTool |
+| **Memory** | 消息历史管理 | Message |
+
+### 核心协作流程
+
+#### 1. Agent 执行流程 (Think-Act 循环)
+
+```
+用户请求
+    │
+    ▼
+BaseAgent.run() ──▶ 添加用户消息到 Memory
+    │
+    ▼
+循环执行 (max_steps 次)
+    │
+    ├─▶ think() ──▶ 调用 LLM.ask_tool() ──▶ 获取工具调用决策
+    │          │
+    │          ▼
+    │       解析 tool_calls
+    │
+    ├─▶ act() ──▶ execute_tool() ──▶ ToolCollection.execute()
+    │          │
+    │          ▼
+    │       执行 BaseTool.execute()
+    │
+    ├─▶ 添加工具结果到 Memory
+    │
+    ▼
+完成 / 达到最大步数 / 收到 Terminate
+```
+
+#### 2. ToolCollection 执行工具流程
+
+```
+ToolCollection.execute(name, tool_input)
+        │
+        ▼
+查找工具 (tool_map)
+        │
+        ▼
+调用 tool.execute(**tool_input)
+        │
+        ▼
+返回 ToolResult (output/error/base64_image)
+```
+
+#### 3. Flow 编排 Agent 流程
+
+```
+PlanningFlow.execute(input_text)
+        │
+        ▼
+_create_initial_plan() ──▶ 调用 LLM 生成计划
+        │
+        ▼
+循环执行计划步骤
+        │
+        ├─▶ _get_current_step_info() ──▶ 获取下一步骤
+        │
+        ├─▶ get_executor() ──▶ 选择合适的 Agent
+        │
+        ├─▶ _execute_step() ──▶ Agent.run(step_prompt)
+        │
+        ├─▶ _mark_step_completed() ──▶ 更新计划状态
+        │
+        ▼
+_finalize_plan() ──▶ 生成最终总结
+```
+
+### 关键数据流
+
+#### 消息流转
+
+```
+User Message → Memory.add_message()
+       ↓
+LLM.ask_tool() 接收 messages
+       ↓
+LLM 返回 response (content + tool_calls)
+       ↓
+Assistant Message → Memory.add_message()
+       ↓
+Tool Result → Memory.add_message()
+       ↓
+循环...
+```
+
+#### 工具调用
+
+```
+LLM 返回 tool_calls
+       ↓
+ToolCallAgent.act() 解析参数
+       ↓
+ToolCollection.execute(name, args)
+       ↓
+BaseTool.execute(**args)
+       ↓
+ToolResult (output/error)
+       ↓
+Message.tool_message() → Memory
+```
+
+### 依赖注入关系
+
+#### 1. Config → LLM
+```
+Config.toml
+    │
+    ▼
+LLM.__init__(config_name) ──▶ 读取配置 ──▶ 创建 OpenAI Client
+```
+
+#### 2. Config → Agent
+```
+Config.toml
+    │
+    ▼
+Manus.create() ──▶ 读取 config.mcp_config ──▶ 初始化 MCP 服务器
+```
+
+#### 3. Agent → LLM
+```
+Agent.__init__()
+    │
+    ▼
+self.llm = LLM(config_name=self.name) ──▶ 单例模式获取 LLM
+```
+
+#### 4. Agent → ToolCollection
+```
+Agent.available_tools: ToolCollection
+    │
+    ▼
+ToolCollection.add_tools() ──▶ 动态扩展工具
+```
+
+### 状态机
+
+#### AgentState 枚举
+```
+IDLE (空闲) ──▶ RUNNING (运行中) ──▶ FINISHED (完成)
+                         │
+                         │ 错误
+                         ▼
+                       ERROR (错误)
+```
+
+#### PlanStepStatus 枚举
+```
+NOT_STARTED ──▶ IN_PROGRESS ──▶ COMPLETED
+                    │
+                    │ 阻塞
+                    ▼
+                 BLOCKED
+```
+
+### 消息类型 (Message)
+
+| 类型 | 角色 (role) | 用途 |
+|------|-------------|------|
+| system | system | 系统提示词 |
+| user | user | 用户输入 |
+| assistant | assistant | LLM 回复 |
+| tool | tool | 工具执行结果 |
+
+### 执行流程时序图
+
+```
+┌─────────┐   ┌──────────┐   ┌─────────┐   ┌─────────────┐   ┌────────┐
+│  User   │   │ManusAgent│   │  LLM    │   │ToolCollection│   │  Tool  │
+└────┬────┘   └────┬─────┘   └────┬────┘   └──────┬──────┘   └────┬───┘
+     │             │              │               │               │
+     │  run()      │              │               │               │
+     ├────────────▶│              │               │               │
+     │             │  ask_tool()  │               │               │
+     │             ├─────────────▶│               │               │
+     │             │              │  tool_calls   │               │
+     │             │◀─────────────┤               │               │
+     │             │              │               │               │
+     │             │ execute()    │               │               │
+     │             │──────────────┼──────────────▶│               │
+     │             │              │               │  execute()    │
+     │             │              │               ├──────────────▶│
+     │             │              │               │               │ 实际执行
+     │             │              │               │◀──────────────┤
+     │             │              │               │  ToolResult   │
+     │             │◀─────────────┼───────────────┤               │
+     │             │   result     │               │               │
+     │             │              │               │               │
+     │◀────────────┤              │               │               │
+     │   output    │              │               │               │
+     │             │              │               │               │
+```
+
+### 模块通信方式
+
+| 通信场景 | 方式 | 说明 |
+|----------|------|------|
+| Agent → LLM | 同步调用 | `await llm.ask_tool()` |
+| Agent → Tool | 同步调用 | `await tool.execute()` |
+| Flow → Agent | 异步调用 | `await agent.run()` |
+| Memory → Agent | 属性访问 | `memory.add_message()` |
+| ToolCollection → Tool | 方法调用 | `tool_map[name]` |
+
+### 配置传递路径
+
+```
+config/config.toml
+        │
+        ▼
+┌────────────────┐
+│    Config      │  ──▶ LLMSettings (llm_config)
+│    (app/config)│  ──▶ BrowserSettings
+└───────┬────────┘  ──▶ SandboxSettings
+        │          ──▶ MCPSettings
+        ▼
+┌────────────────┐
+│     LLM        │  ──▶ api_key, base_url, model
+└───────┬────────┘
+        │
+        ▼
+┌────────────────┐
+│    Agent       │  ──▶ self.llm = LLM()
+└───────┬────────┘
+        │
+        ▼
+┌────────────────┐
+│ToolCallAgent   │  ──▶ self.available_tools
+└────────────────┘
+```
+
+---
+
 ## Tool 模块详解
 
 ### 基础工具类
@@ -309,16 +614,314 @@ BaseAgent (抽象基类)
 
 ## MCP 集成
 
-### MCP Server (`app/mcp/server.py`)
+MCP (Model Context Protocol) 是一个标准化协议，允许 AI Agent 与外部工具和服务进行交互。OpenManus 提供了完整的 MCP 客户端和服务器支持。
 
-- 使用 FastMCP 框架构建
-- 支持工具注册和传输管理
-- 支持 stdio 传输方式
+### MCP 架构概览
 
-### MCP Agent (`app/agent/mcp.py`)
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      MCP 生态系统                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────┐           ┌─────────────────┐            │
+│   │   MCP Client    │           │   MCP Server    │            │
+│   │  (MCPAgent/     │◀─────────▶│  (run_mcp_server│            │
+│   │   Manus)        │   stdio   │   .py)          │            │
+│   └────────┬────────┘   /sse    └────────┬────────┘            │
+│            │                             │                     │
+│            │                             │                     │
+│            ▼                             ▼                     │
+│   ┌─────────────────────────────────────────────────┐          │
+│   │              工具调用流程                         │          │
+│   │  LLM → think() → act() → execute_tool()         │          │
+│   │       ↓                                          │          │
+│   │  ToolCollection.execute()                        │          │
+│   │       ↓                                          │          │
+│   │  MCPClientTool.execute() → MCP Session           │          │
+│   │                      ↓                           │          │
+│   │              远程 MCP Server                      │          │
+│   └─────────────────────────────────────────────────┘          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-- 支持连接外部 MCP 服务器
-- 动态加载 MCP 服务器提供的工具
+### MCP 组件
+
+| 组件 | 文件 | 功能 |
+|------|------|------|
+| **MCPAgent** | `app/agent/mcp.py` | 连接 MCP 服务器并使用其工具 |
+| **MCPClients** | `app/tool/mcp.py` | 管理多个 MCP 连接和工具 |
+| **MCPClientTool** | `app/tool/mcp.py` | 代理工具，调用远程 MCP 服务 |
+| **MCPServer** | `app/mcp/server.py` | 将 OpenManus 作为 MCP 服务器运行 |
+
+### 1. 使用 MCP Agent 连接外部服务器
+
+MCPAgent 可以连接外部 MCP 服务器并使用其工具。
+
+#### 命令行方式
+
+```bash
+# stdio 连接（默认）
+python run_mcp.py
+
+# SSE 连接
+python run_mcp.py --connection sse --server-url http://localhost:8080/sse
+
+# 交互模式
+python run_mcp.py --interactive
+
+# 单次执行
+python run_mcp.py --prompt "使用 filesystem 工具列出文件"
+```
+
+#### 代码方式
+
+```python
+import asyncio
+from app.agent.mcp import MCPAgent
+
+async def main():
+    # 创建 Agent
+    agent = MCPAgent()
+
+    # 方式1: stdio 连接
+    await agent.initialize(
+        connection_type="stdio",
+        command="python",  # 或其他 MCP 服务器命令
+        args=["-m", "my_mcp_server"]
+    )
+
+    # 方式2: SSE 连接
+    # await agent.initialize(
+    #     connection_type="sse",
+    #     server_url="http://localhost:8080/sse"
+    # )
+
+    # 运行任务
+    result = await agent.run("请列出当前目录的文件")
+    print(result)
+
+    # 清理
+    await agent.cleanup()
+
+asyncio.run(main())
+```
+
+### 2. 在 Manus 中使用 MCP
+
+Manus Agent 支持通过配置文件连接多个 MCP 服务器。
+
+#### 配置文件 (`config/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextplugin/server-filesystem", "/path/to/dir"]
+    },
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextplugin/server-github"]
+    },
+    "remote-server": {
+      "type": "sse",
+      "url": "http://localhost:8080/sse"
+    }
+  }
+}
+```
+
+#### 启动使用 MCP 的 Manus
+
+```bash
+python main.py --prompt "使用 filesystem 工具读取 config.toml 文件"
+```
+
+### 3. 将 OpenManus 作为 MCP 服务器
+
+将 OpenManus 的工具暴露为 MCP 服务，供其他客户端使用。
+
+#### 启动 MCP 服务器
+
+```bash
+# stdio 模式（默认）
+python run_mcp_server.py
+
+# 指定传输方式
+python run_mcp_server.py --transport stdio
+```
+
+#### 可用工具
+
+MCP 服务器暴露以下工具：
+
+| 工具名 | 功能 |
+|--------|------|
+| `bash` | 执行 Shell 命令 |
+| `browser` | 浏览器自动化操作 |
+| `editor` | 文件编辑 |
+| `terminate` | 终止当前任务 |
+
+#### 在其他应用中连接
+
+```python
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+import asyncio
+
+async def main():
+    # 连接到 OpenManus MCP 服务器
+    server_params = StdioServerParameters(
+        command="python",
+        args=["run_mcp_server.py"]
+    )
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            # 初始化会话
+            await session.initialize()
+
+            # 列出可用工具
+            tools = await session.list_tools()
+            print("Available tools:", [t.name for t in tools])
+
+            # 调用工具
+            result = await session.call_tool("bash", {"command": "ls -la"})
+            print(result.content[0].text)
+
+asyncio.run(main())
+```
+
+### 4. 创建自定义 MCP 服务器
+
+#### 使用 FastMCP 创建
+
+```python
+# my_mcp_server.py
+from mcp.server.fastmcp import FastMCP
+from app.tool.base import BaseTool, ToolResult
+
+app = FastMCP("my-server")
+
+# 注册函数
+@app.tool()
+def get_weather(city: str) -> str:
+    """获取城市天气"""
+    return f"{city} 的天气是晴天"
+
+@app.tool()
+def calculate(a: int, b: int) -> int:
+    """执行计算"""
+    return a + b
+
+if __name__ == "__main__":
+    app.run()
+```
+
+#### 连接到自定义服务器
+
+```python
+from app.agent.mcp import MCPAgent
+import asyncio
+
+async def main():
+    agent = MCPAgent()
+    await agent.initialize(
+        connection_type="stdio",
+        command="python",
+        args=["my_mcp_server.py"]
+    )
+
+    result = await agent.run("北京天气怎么样？")
+    print(result)
+
+asyncio.run(main())
+```
+
+### 5. MCPClients 工具管理
+
+MCPClients 继承自 ToolCollection，管理多个 MCP 服务器连接。
+
+```python
+from app.tool.mcp import MCPClients
+
+# 创建客户端集合
+clients = MCPClients()
+
+# 连接多个服务器
+await clients.connect_stdio(
+    command="python",
+    args=["-m", "server_a"],
+    server_id="server_a"
+)
+
+await clients.connect_sse(
+    server_url="http://localhost:8080/sse",
+    server_id="server_b"
+)
+
+# 访问工具
+tool = clients.tool_map["mcp_server_a_my_tool"]
+result = await tool.execute(param="value")
+
+# 断开连接
+await clients.disconnect("server_a")
+await clients.disconnect()  # 断开所有
+```
+
+### 6. 工具名称转换
+
+MCP 工具名会自动转换为 OpenManus 格式：
+
+```
+原始工具名: get_weather
+转换后:     mcp_{server_id}_get_weather
+
+示例:
+  server_id = "filesystem"
+  原始:      read_file
+  转换后:    mcp_filesystem_read_file
+```
+
+### 7. 配置管理
+
+#### MCPSettings 配置类
+
+| 配置项 | 类型 | 说明 |
+|--------|------|------|
+| `server_reference` | str | MCP 服务器模块引用 |
+| `servers` | Dict[str, MCPServerConfig] | 服务器配置字典 |
+
+#### MCPServerConfig 配置类
+
+| 配置项 | 类型 | 说明 |
+|--------|------|------|
+| `type` | str | 连接类型 (`stdio` 或 `sse`) |
+| `url` | str | SSE 连接的 URL |
+| `command` | str | stdio 连接的命令 |
+| `args` | List[str] | 命令参数 |
+
+### 8. 最佳实践
+
+1. **连接管理**: 使用 `async/await` 确保正确清理连接
+2. **工具刷新**: MCPAgent 会定期刷新工具列表
+3. **错误处理**: MCPClientTool 会捕获并返回远程错误
+4. **名称转换**: 注意工具名的前缀转换
+5. **超时设置**: SSE 连接可能需要配置超时
+
+### 常见问题
+
+**Q: 工具调用失败**
+A: 检查 MCP 服务器是否正常运行，确认工具名称前缀正确
+
+**Q: SSE 连接超时**
+A: 检查网络配置，确保服务器 URL 可访问
+
+**Q: 工具不存在**
+A: 确认 mcp.json 配置正确，重新启动 Agent
 
 ---
 
@@ -376,23 +979,74 @@ python run_mcp_server.py
 
 ## 扩展开发
 
-### 添加新工具
+详细的扩展开发指南请参考以下独立文档：
 
-1. 继承 `BaseTool` 类
-2. 实现 `tool_call` 方法
-3. 在 Agent 中注册工具
+### 1. 添加新工具
+**文档**: [DEVELOP_TOOL.md](./DEVELOP_TOOL.md)
 
-### 添加新 Agent
+包含：
+- 工具继承结构
+- BaseTool 类的使用
+- 在 Agent 中注册工具的三种方式
+- 完整示例（计算器工具）
+- ToolResult 响应处理
+- 最佳实践
 
-1. 继承 `BaseAgent` 或 `ToolCallAgent`
-2. 实现 `run` 方法
-3. 配置工具集合
+### 2. 添加新 Agent
+**文档**: [DEVELOP_AGENT.md](./DEVELOP_AGENT.md)
 
-### 添加新 Flow
+包含：
+- Agent 继承层次
+- 创建简单 Agent
+- 创建 ToolCallAgent（完整模板）
+- 继承现有 Agent（Manus 等）
+- Agent 生命周期方法
+- 专用 Agent 示例（数据分析、浏览器操作）
 
-1. 继承 `BaseFlow` 类
-2. 实现 `execute` 方法
-3. 使用 FlowFactory 注册
+### 3. 添加新 Flow
+**文档**: [DEVELOP_FLOW.md](./DEVELOP_FLOW.md)
+
+包含：
+- Flow 基础实现
+- 使用 FlowFactory 注册
+- 多步骤处理流程示例
+- 继承 PlanningFlow
+- Agent 管理与资源清理
+- 与 Tool 和外部服务集成
+
+### 快速示例
+
+**添加工具**:
+```python
+from app.tool.base import BaseTool, ToolResult
+
+class MyTool(BaseTool):
+    name: str = "my_tool"
+    description: str = "我的工具"
+    parameters: dict = {...}
+
+    async def execute(self, **kwargs) -> ToolResult:
+        return self.success_response("结果")
+```
+
+**创建 Agent**:
+```python
+from app.agent.toolcall import ToolCallAgent
+
+class MyAgent(ToolCallAgent):
+    name: str = "my_agent"
+    available_tools: ToolCollection = Field(default_factory=lambda: ToolCollection(MyTool()))
+```
+
+**创建 Flow**:
+```python
+from app.flow.base import BaseFlow
+
+class MyFlow(BaseFlow):
+    async def execute(self, task: str) -> str:
+        # 流程逻辑
+        return "结果"
+```
 
 ---
 
